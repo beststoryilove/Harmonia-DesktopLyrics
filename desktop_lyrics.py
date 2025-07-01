@@ -6,6 +6,8 @@ import queue
 import threading
 import sys
 import re
+import pystray
+from PIL import Image
 from datetime import timedelta
 
 class DesktopLyrics:
@@ -23,36 +25,36 @@ class DesktopLyrics:
         # 设置窗口背景为黑色（透明部分）
         self.root.config(bg="black")
         
-        # 创建歌曲信息标签（放在顶部）
+        # 创建歌曲信息标签（放在顶部）- 改为黄色
         self.song_label = tk.Label(
             self.root, 
             text="等待连接...",  # 初始状态
             font=("Microsoft YaHei", 12),
-            fg="#aaaaaa", 
+            fg="yellow",  # 改为黄色
             bg="black",
             padx=10,
             pady=5
         )
         self.song_label.pack(anchor="center")
         
-        # 创建歌词标签（放在中间）
+        # 创建歌词标签（放在中间）- 保持紫色不变
         self.lyric_label = tk.Label(
             self.root, 
             text="", 
             font=("Microsoft YaHei", 24, "bold"),
-            fg="#9b59b6", 
+            fg="#9b59b6",  # 保持紫色不变
             bg="black", 
             padx=20,
             pady=10
         )
         self.lyric_label.pack(expand=True, fill="both")
         
-        # 创建翻译歌词标签（放在底部）
+        # 创建翻译歌词标签（放在底部）- 改为黄色
         self.translation_label = tk.Label(
             self.root, 
             text="", 
             font=("Microsoft YaHei", 16),
-            fg="#777777", 
+            fg="yellow",  # 改为黄色
             bg="black", 
             padx=20,
             pady=5
@@ -82,6 +84,65 @@ class DesktopLyrics:
         
         # 定期检查消息队列
         self.root.after(100, self.process_queue)
+        
+        # 系统托盘图标
+        self.tray_icon = None
+        self.create_tray_icon()
+        
+        # 连接管理器
+        self.connected_clients = set()
+    
+    def create_tray_icon(self):
+        """创建系统托盘图标"""
+        # 创建图标图像（简单的黄色音符）
+        image = Image.new('RGB', (64, 64), "black")
+        for i in range(10, 54):
+            for j in range(20, 40):
+                image.putpixel((i, j), (255, 255, 0))  # 黄色横线
+        for i in range(50, 54):
+            for j in range(10, 50):
+                image.putpixel((i, j), (255, 255, 0))  # 黄色竖线
+        
+        # 创建托盘菜单
+        menu = pystray.Menu(
+            pystray.MenuItem("断开连接", self.disconnect_client),
+            pystray.MenuItem("退出", self.quit_application)
+        )
+        
+        # 创建托盘图标
+        self.tray_icon = pystray.Icon(
+            "harmonia_lyrics", 
+            image, 
+            "Harmonia桌面歌词", 
+            menu
+        )
+        
+        # 在单独的线程中运行托盘图标
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+    
+    def disconnect_client(self):
+        """断开当前连接的客户端"""
+        if self.connected_clients:
+            print("主动断开客户端连接")
+            for client in list(self.connected_clients):
+                try:
+                    asyncio.run_coroutine_threadsafe(client.close(), asyncio.get_event_loop())
+                except Exception as e:
+                    print(f"断开连接时出错: {e}")
+            
+            # 清空客户端集合
+            self.connected_clients.clear()
+            
+            # 更新UI状态
+            self.safe_update("clear")
+            self.safe_update("status", "disconnected")
+    
+    def quit_application(self):
+        """退出应用程序"""
+        print("退出应用程序")
+        self.disconnect_client()
+        self.root.after(100, self.root.destroy)
+        self.tray_icon.stop()
     
     def start_move(self, event):
         self.x = event.x
@@ -102,9 +163,9 @@ class DesktopLyrics:
         """更新连接状态"""
         self.connection_status = status
         if status == "connected":
-            self.song_label.config(text="已连接 - 等待歌曲...", fg="#2ecc71")
+            self.song_label.config(text="已连接 - 等待歌曲...", fg="yellow")  # 改为黄色
         elif status == "disconnected":
-            self.song_label.config(text="等待连接...", fg="#aaaaaa")
+            self.song_label.config(text="等待连接...", fg="yellow")  # 改为黄色
     
     def parse_lyrics(self, lyric_text):
         """解析LRC格式歌词"""
@@ -202,7 +263,7 @@ class DesktopLyrics:
                     self.current_song = data.get('song', '')
                     self.current_artist = data.get('artist', '')
                     song_text = f"{self.current_song} - {self.current_artist}"
-                    self.song_label.config(text=song_text, fg="#aaaaaa")
+                    self.song_label.config(text=song_text, fg="yellow")  # 改为黄色
                 elif msg_type == "full_lyric":
                     self.update_full_lyrics(data.get('lyric', ''), data.get('tlyric', ''))
                 elif msg_type == "time":
@@ -210,7 +271,7 @@ class DesktopLyrics:
                 elif msg_type == "clear":
                     self.lyric_label.config(text="")
                     self.translation_label.config(text="")
-                    self.song_label.config(text="等待连接...", fg="#aaaaaa")
+                    self.song_label.config(text="等待连接...", fg="yellow")  # 改为黄色
                     self.current_lyric = ""
                     self.current_translation = ""
                     self.current_song = ""
@@ -232,12 +293,15 @@ class DesktopLyrics:
             self.root.mainloop()
         except KeyboardInterrupt:
             print("\n程序已退出")
-            sys.exit(0)
+            self.quit_application()
 
-def start_websocket_server():
+def start_websocket_server(desktop_lyrics):
     async def handle_connection(websocket):
         """处理WebSocket连接"""
         print("客户端已连接")
+        # 保存连接
+        desktop_lyrics.connected_clients.add(websocket)
+        
         # 更新连接状态
         desktop_lyrics.safe_update("status", "connected")
         
@@ -268,6 +332,10 @@ def start_websocket_server():
         except Exception as e:
             print(f"连接错误: {e}")
             desktop_lyrics.safe_update("status", "disconnected")
+        finally:
+            # 移除连接
+            if websocket in desktop_lyrics.connected_clients:
+                desktop_lyrics.connected_clients.remove(websocket)
     
     async def websocket_server():
         async with websockets.serve(handle_connection, "localhost", 8765):
@@ -284,7 +352,11 @@ if __name__ == "__main__":
     desktop_lyrics = DesktopLyrics()
     
     # 在单独的线程中启动WebSocket服务器
-    server_thread = threading.Thread(target=start_websocket_server, daemon=True)
+    server_thread = threading.Thread(
+        target=start_websocket_server, 
+        args=(desktop_lyrics,),
+        daemon=True
+    )
     server_thread.start()
     
     # 在主线程中启动Tkinter主循环
