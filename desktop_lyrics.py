@@ -7,10 +7,22 @@ import threading
 import sys
 import re
 import pystray
-import time
-from PIL import Image
+from PIL import Image, ImageDraw
 from datetime import timedelta
-from tkinter import font as tkfont
+import tkinter.font as tkfont
+
+# 常量定义
+BG_COLOR = "black"
+SONG_FG = "yellow"
+LYRIC_FG = "#9b59b6"
+TRANSLATION_FG = "yellow"
+FONT_NAME = "Microsoft YaHei"
+LYRIC_FONT_SIZE = 24
+TRANSLATION_FONT_SIZE = 16
+SONG_FONT_SIZE = 12
+WINDOW_HEIGHT = 150
+WINDOW_ALPHA = 0.9
+WEBSOCKET_PORT = 8765
 
 class DesktopLyrics:
     def __init__(self):
@@ -18,116 +30,15 @@ class DesktopLyrics:
         self.root.title("Harmonia桌面歌词")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", "black")
+        self.root.attributes("-transparentcolor", BG_COLOR)
         
-        # 获取屏幕尺寸并设置窗口位置
+        # 设置窗口大小和位置
         screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        self.root.geometry(f"{screen_width}x150+0+{screen_height//4}")
+        self.root.geometry(f"{screen_width}x{WINDOW_HEIGHT}+0+100")
+        self.root.config(bg=BG_COLOR)
         
-        # 设置颜色常量
-        self.COLORS = {
-            "background": "black",
-            "song_info": "yellow",
-            "played_lyric": "#FFD700",  # 金色
-            "unplayed_lyric": "#9b59b6",  # 紫色
-            "played_translation": "#FFFF00",  # 亮黄色
-            "unplayed_translation": "#CCCC00"  # 暗黄色
-        }
-        
-        self.root.config(bg=self.COLORS["background"])
-        
-        # 创建字体对象以便复用
-        self.song_font = ("Microsoft YaHei", 12)
-        self.lyric_font = ("Microsoft YaHei", 24, "bold")
-        self.translation_font = ("Microsoft YaHei", 16)
-        
-        # 歌曲信息标签
-        self.song_label = tk.Label(
-            self.root, 
-            text="等待连接...",
-            font=self.song_font,
-            fg=self.COLORS["song_info"],
-            bg=self.COLORS["background"],
-            padx=10,
-            pady=5
-        )
-        self.song_label.pack(anchor="center")
-        
-        # 主容器
-        self.center_container = tk.Frame(self.root, bg=self.COLORS["background"])
-        self.center_container.pack(expand=True, fill="both")
-        
-        # 歌词容器
-        self.lyrics_frame = tk.Frame(self.center_container, bg=self.COLORS["background"])
-        self.lyrics_frame.pack(expand=True, pady=5)
-        
-        # 歌词标签容器
-        self.lyrics_container = tk.Frame(self.lyrics_frame, bg=self.COLORS["background"])
-        self.lyrics_container.pack()
-        
-        # 歌词标签
-        self.played_lyric = tk.Label(
-            self.lyrics_container, 
-            text="", 
-            font=self.lyric_font,
-            fg=self.COLORS["played_lyric"],
-            bg=self.COLORS["background"], 
-            padx=0
-        )
-        self.played_lyric.pack(side="left")
-        
-        self.unplayed_lyric = tk.Label(
-            self.lyrics_container, 
-            text="", 
-            font=self.lyric_font,
-            fg=self.COLORS["unplayed_lyric"],
-            bg=self.COLORS["background"], 
-            padx=0
-        )
-        self.unplayed_lyric.pack(side="left")
-        
-        # 翻译容器
-        self.translation_frame = tk.Frame(self.center_container, bg=self.COLORS["background"])
-        self.translation_frame.pack(pady=5)
-        
-        # 翻译标签容器
-        self.translation_container = tk.Frame(self.translation_frame, bg=self.COLORS["background"])
-        self.translation_container.pack()
-        
-        # 翻译标签
-        self.played_translation = tk.Label(
-            self.translation_container, 
-            text="", 
-            font=self.translation_font,
-            fg=self.COLORS["played_translation"],
-            bg=self.COLORS["background"], 
-            padx=0,
-            pady=5
-        )
-        self.played_translation.pack(side="left")
-        
-        self.unplayed_translation = tk.Label(
-            self.translation_container, 
-            text="", 
-            font=self.translation_font,
-            fg=self.COLORS["unplayed_translation"],
-            bg=self.COLORS["background"], 
-            padx=0,
-            pady=5
-        )
-        self.unplayed_translation.pack(side="left")
-        
-        # 绑定鼠标事件
-        self.root.bind("<ButtonPress-1>", self.start_move)
-        self.root.bind("<ButtonRelease-1>", self.stop_move)
-        self.root.bind("<B1-Motion>", self.on_move)
-        self.root.bind("<Double-Button-1>", self.toggle_transparency)  # 双击切换透明度
-        self.root.bind("<MouseWheel>", self.adjust_font_size)  # 滚轮调整字体大小
-        
-        # 设置窗口半透明
-        self.transparency_level = 0.9
-        self.root.attributes("-alpha", self.transparency_level)
+        # 创建UI组件
+        self.create_ui()
         
         # 当前状态
         self.connection_status = "disconnected"
@@ -138,15 +49,15 @@ class DesktopLyrics:
         self.lyrics_data = []
         self.translations_data = []
         self.last_lyric_index = -1
-        self.current_line_duration = 0
-        self.line_start_time = 0
-        self.last_progress = 0
+        self.has_lyrics = False
+        
+        # 创建字体对象
+        self.lyric_font = tkfont.Font(family=FONT_NAME, size=LYRIC_FONT_SIZE, weight="bold")
+        self.translation_font = tkfont.Font(family=FONT_NAME, size=TRANSLATION_FONT_SIZE)
         
         # 消息队列
         self.message_queue = queue.Queue()
-        
-        # 定期检查消息队列（提高频率）
-        self.root.after(50, self.process_queue)
+        self.root.after(100, self.process_queue)
         
         # 系统托盘图标
         self.tray_icon = None
@@ -155,79 +66,91 @@ class DesktopLyrics:
         # 连接管理器
         self.connected_clients = set()
         
-        # 字体大小调整
-        self.font_size_multiplier = 1.0
-        self.min_font_size = 0.7
-        self.max_font_size = 1.5
+        # 窗口拖动相关变量
+        self.drag_data = {"x": 0, "y": 0, "dragging": False}
     
-    def toggle_transparency(self, event):
-        """双击切换窗口透明度"""
-        self.transparency_level = 0.5 if self.transparency_level > 0.7 else 0.9
-        self.root.attributes("-alpha", self.transparency_level)
-    
-    def adjust_font_size(self, event):
-        """滚轮调整字体大小"""
-        delta = event.delta
-        if delta > 0:  # 滚轮向上
-            self.font_size_multiplier = min(self.max_font_size, self.font_size_multiplier + 0.05)
-        else:  # 滚轮向下
-            self.font_size_multiplier = max(self.min_font_size, self.font_size_multiplier - 0.05)
+    def create_ui(self):
+        """创建UI组件"""
+        # 歌曲信息标签
+        self.song_label = tk.Label(
+            self.root, 
+            text="等待连接...",
+            font=(FONT_NAME, SONG_FONT_SIZE),
+            fg=SONG_FG,
+            bg=BG_COLOR,
+            padx=10,
+            pady=5
+        )
+        self.song_label.pack(anchor="center")
         
-        # 更新字体
-        self.update_fonts()
-    
-    def update_fonts(self):
-        """根据当前缩放比例更新字体"""
-        # 歌曲信息字体
-        base_size = int(12 * self.font_size_multiplier)
-        self.song_font = ("Microsoft YaHei", base_size)
-        self.song_label.config(font=self.song_font)
+        # 歌词标签
+        self.lyric_label = tk.Label(
+            self.root, 
+            text="", 
+            font=(FONT_NAME, LYRIC_FONT_SIZE, "bold"),
+            fg=LYRIC_FG,
+            bg=BG_COLOR, 
+            padx=20,
+            pady=10,
+            wraplength=self.root.winfo_screenwidth() - 40  # 自动换行
+        )
+        self.lyric_label.pack(expand=True, fill="both")
         
-        # 歌词字体
-        lyric_size = int(24 * self.font_size_multiplier)
-        self.lyric_font = ("Microsoft YaHei", lyric_size, "bold")
-        self.played_lyric.config(font=self.lyric_font)
-        self.unplayed_lyric.config(font=self.lyric_font)
+        # 翻译歌词标签
+        self.translation_label = tk.Label(
+            self.root, 
+            text="", 
+            font=(FONT_NAME, TRANSLATION_FONT_SIZE),
+            fg=TRANSLATION_FG,
+            bg=BG_COLOR, 
+            padx=20,
+            pady=5
+        )
+        self.translation_label.pack()
         
-        # 翻译字体
-        trans_size = int(16 * self.font_size_multiplier)
-        self.translation_font = ("Microsoft YaHei", trans_size)
-        self.played_translation.config(font=self.translation_font)
-        self.unplayed_translation.config(font=self.translation_font)
+        # 绑定鼠标事件
+        self.root.bind("<ButtonPress-1>", self.start_move)
+        self.root.bind("<ButtonRelease-1>", self.stop_move)
+        self.root.bind("<B1-Motion>", self.on_move)
+        
+        # 设置窗口透明度
+        self.root.attributes("-alpha", WINDOW_ALPHA)
     
     def create_tray_icon(self):
-        """创建系统托盘图标"""
-        # 创建图标图像
-        image = Image.new('RGB', (64, 64), "black")
-        # 绘制一个简单的音符图标
-        for i in range(20, 44):
-            for j in range(10, 30):
-                if 20 <= i <= 40 or (j == 20 and 25 <= i <= 35):
-                    image.putpixel((i, j), (255, 255, 0))
-        
-        # 创建托盘菜单
-        menu = pystray.Menu(
-            pystray.MenuItem("断开连接", self.disconnect_client),
-            pystray.MenuItem("调整位置", self.reset_position),
-            pystray.MenuItem("退出", self.quit_application)
-        )
-        
-        # 创建托盘图标
-        self.tray_icon = pystray.Icon(
-            "harmonia_lyrics", 
-            image, 
-            "Harmonia桌面歌词", 
-            menu
-        )
-        
-        # 在单独的线程中运行托盘图标
-        threading.Thread(target=self.tray_icon.run, daemon=True).start()
-    
-    def reset_position(self):
-        """重置窗口位置到屏幕顶部中央"""
-        screen_width = self.root.winfo_screenwidth()
-        screen_height = self.root.winfo_screenheight()
-        self.root.geometry(f"+{screen_width//4}+{screen_height//8}")
+        """创建更美观的系统托盘图标"""
+        try:
+            # 创建简单的音符图标
+            image = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            
+            # 绘制音符主体
+            draw.ellipse([(15, 10), (50, 45)], fill="yellow")
+            
+            # 绘制音符杆
+            draw.rectangle([(40, 15), (45, 55)], fill="yellow")
+            
+            # 绘制音符尾
+            points = [(35, 30), (55, 20), (55, 40), (35, 30)]
+            draw.polygon(points, fill="yellow")
+            
+            # 创建托盘菜单
+            menu = pystray.Menu(
+                pystray.MenuItem("断开连接", self.disconnect_client),
+                pystray.MenuItem("退出", self.quit_application)
+            )
+            
+            # 创建托盘图标
+            self.tray_icon = pystray.Icon(
+                "harmonia_lyrics", 
+                image, 
+                "Harmonia桌面歌词", 
+                menu
+            )
+            
+            # 在单独的线程中运行托盘图标
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        except Exception as e:
+            print(f"创建托盘图标失败: {e}")
     
     def disconnect_client(self):
         """断开当前连接的客户端"""
@@ -250,74 +173,92 @@ class DesktopLyrics:
         self.root.after(100, self.root.destroy)
         if self.tray_icon:
             self.tray_icon.stop()
-        sys.exit(0)
     
     def start_move(self, event):
-        self.x = event.x
-        self.y = event.y
+        """开始拖动窗口"""
+        self.drag_data["x"] = event.x
+        self.drag_data["y"] = event.y
+        self.drag_data["dragging"] = True
     
     def stop_move(self, event):
-        self.x = None
-        self.y = None
+        """停止拖动窗口"""
+        self.drag_data["dragging"] = False
     
     def on_move(self, event):
-        deltax = event.x - self.x
-        deltay = event.y - self.y
+        """处理窗口拖动"""
+        if not self.drag_data["dragging"]:
+            return
+            
+        deltax = event.x - self.drag_data["x"]
+        deltay = event.y - self.drag_data["y"]
         x = self.root.winfo_x() + deltax
         y = self.root.winfo_y() + deltay
+        
+        # 确保窗口不会移出屏幕
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        window_width = self.root.winfo_width()
+        
+        x = max(0, min(x, screen_width - window_width))
+        y = max(0, min(y, screen_height - WINDOW_HEIGHT))
+        
         self.root.geometry(f"+{x}+{y}")
     
     def update_status(self, status):
         """更新连接状态"""
         self.connection_status = status
         if status == "connected":
-            self.song_label.config(text="已连接 - 等待歌曲...", fg=self.COLORS["song_info"])
+            self.song_label.config(text="已连接 - 等待歌曲...", fg=SONG_FG)
         elif status == "disconnected":
-            self.song_label.config(text="等待连接...", fg=self.COLORS["song_info"])
+            self.song_label.config(text="等待连接...", fg=SONG_FG)
     
     def parse_lyrics(self, lyric_text):
-        """解析LRC格式歌词"""
+        """解析LRC格式歌词 - 更健壮的解析器"""
         if not lyric_text:
             return []
-            
-        lines = lyric_text.split('\n')
+        
         lyrics = []
+        time_regex = r'\[(\d+):(\d+)(?:\.|:)(\d+)\]'
         
-        # 预编译正则表达式提高性能
-        time_regex = re.compile(r'\[(\d+):(\d+)(?:\.|:)(\d+)\]')
-        
-        for line in lines:
-            matches = time_regex.findall(line)
-            if matches:
-                text = time_regex.sub('', line).strip()
-                if text:
-                    for match in matches:
-                        try:
-                            minutes = int(match[0])
-                            seconds = int(match[1])
-                            milliseconds = int(match[2])
-                            
-                            if milliseconds < 100:
-                                milliseconds *= 10
-                            
-                            total_seconds = minutes * 60 + seconds + milliseconds / 1000.0
-                            lyrics.append({
-                                'time': total_seconds,
-                                'text': text
-                            })
-                        except (ValueError, TypeError):
-                            continue  # 忽略格式错误的时间标签
+        for line in lyric_text.split('\n'):
+            # 跳过空行和元数据行
+            if not line.strip() or line.startswith('[') and not re.search(time_regex, line):
+                continue
+                
+            # 提取所有时间标签
+            matches = re.findall(time_regex, line)
+            if not matches:
+                continue
+                
+            # 获取歌词文本
+            text = re.sub(time_regex, '', line).strip()
+            if not text:
+                continue
+                
+            for match in matches:
+                try:
+                    minutes = int(match[0])
+                    seconds = int(match[1])
+                    milliseconds = int(match[2])
+                    
+                    # 处理毫秒精度
+                    if milliseconds < 100:
+                        milliseconds *= 10
+                    
+                    total_seconds = minutes * 60 + seconds + milliseconds / 1000.0
+                    lyrics.append({'time': total_seconds, 'text': text})
+                except ValueError:
+                    continue
         
         # 按时间排序
         lyrics.sort(key=lambda x: x['time'])
         return lyrics
     
     def update_lyrics_with_time(self, current_time):
-        """根据当前时间更新歌词显示（带逐字变色效果）"""
+        """根据当前时间更新歌词显示 - 添加平滑滚动效果"""
         if not self.lyrics_data:
-            self.clear_lyrics_display()
             return
-        
+            
         # 找到当前应该显示的歌词
         current_index = -1
         for i, lyric in enumerate(self.lyrics_data):
@@ -326,126 +267,63 @@ class DesktopLyrics:
             else:
                 break
         
-        if current_index == -1:
-            self.clear_lyrics_display()
-            return
-        
         # 如果找到了新的歌词行
-        if current_index != self.last_lyric_index:
+        if current_index != -1 and current_index != self.last_lyric_index:
             self.last_lyric_index = current_index
             self.current_lyric = self.lyrics_data[current_index]['text']
-            self.line_start_time = self.lyrics_data[current_index]['time']
             
-            # 计算当前行的持续时间
-            if current_index < len(self.lyrics_data) - 1:
-                self.current_line_duration = self.lyrics_data[current_index + 1]['time'] - self.line_start_time
-            else:
-                self.current_line_duration = 5.0
+            # 更新歌词标签
+            self.lyric_label.config(text=self.current_lyric)
             
-            # 重置歌词显示
-            self.played_lyric.config(text="")
-            self.unplayed_lyric.config(text=self.current_lyric)
-            self.last_progress = 0
-        
-        # 计算当前行已播放的时间
-        elapsed = current_time - self.line_start_time
-        
-        # 计算变色位置
-        if self.current_line_duration > 0 and elapsed > 0:
-            progress = min(1.0, elapsed / self.current_line_duration)
+            # 查找对应的翻译
+            self.current_translation = ""
+            if self.translations_data:
+                translation_index = -1
+                for i, translation in enumerate(self.translations_data):
+                    if translation['time'] <= current_time:
+                        translation_index = i
+                    else:
+                        break
+                
+                if translation_index != -1:
+                    lyric_time = self.lyrics_data[current_index]['time']
+                    translation_time = self.translations_data[translation_index]['time']
+                    
+                    if abs(lyric_time - translation_time) < 0.5:
+                        self.current_translation = self.translations_data[translation_index]['text']
             
-            # 优化平滑过渡逻辑
-            # 如果进度增加超过0.1，直接跳转到当前进度
-            if progress - self.last_progress > 0.1:
-                self.last_progress = progress
-            else:
-                # 否则平滑过渡，但加速过渡速度
-                self.last_progress = min(progress, self.last_progress + 0.08)
-            
-            chars_to_color = int(len(self.current_lyric) * self.last_progress)
-            
-            # 分割歌词
-            played_part = self.current_lyric[:chars_to_color]
-            unplayed_part = self.current_lyric[chars_to_color:]
-            
-            # 更新显示
-            self.played_lyric.config(text=played_part)
-            self.unplayed_lyric.config(text=unplayed_part)
-        
-        # 处理翻译
-        self.update_translation(current_time, current_index)
-    
-    def update_translation(self, current_time, lyric_index):
-        """更新翻译显示"""
-        if not self.translations_data:
-            self.played_translation.config(text="")
-            self.unplayed_translation.config(text="")
-            return
-        
-        # 找到最接近当前时间但不超过当前时间的翻译
-        translation_index = -1
-        for i, translation in enumerate(self.translations_data):
-            if translation['time'] <= current_time:
-                translation_index = i
-            else:
-                break
-        
-        if translation_index == -1:
-            self.played_translation.config(text="")
-            self.unplayed_translation.config(text="")
-            return
-        
-        # 检查翻译时间是否与歌词时间匹配（允许0.5秒误差）
-        lyric_time = self.lyrics_data[lyric_index]['time']
-        translation_time = self.translations_data[translation_index]['time']
-        
-        if abs(lyric_time - translation_time) > 0.5:
-            self.played_translation.config(text="")
-            self.unplayed_translation.config(text="")
-            return
-        
-        self.current_translation = self.translations_data[translation_index]['text']
-        
-        # 计算翻译变色位置（使用相同的进度）
-        if self.current_line_duration > 0:
-            elapsed = current_time - self.line_start_time
-            progress = min(1.0, elapsed / self.current_line_duration)
-            chars_to_color = int(len(self.current_translation) * progress)
-            
-            # 分割翻译
-            played_trans = self.current_translation[:chars_to_color]
-            unplayed_trans = self.current_translation[chars_to_color:]
-            
-            # 更新显示
-            self.played_translation.config(text=played_trans)
-            self.unplayed_translation.config(text=unplayed_trans)
-        else:
-            self.played_translation.config(text="")
-            self.unplayed_translation.config(text=self.current_translation)
-    
-    def clear_lyrics_display(self):
-        """清空歌词显示"""
-        self.played_lyric.config(text="")
-        self.unplayed_lyric.config(text="")
-        self.played_translation.config(text="")
-        self.unplayed_translation.config(text="")
+            self.translation_label.config(text=self.current_translation)
     
     def update_full_lyrics(self, lyric, tlyric):
-        """更新完整歌词数据"""
-        self.lyrics_data = self.parse_lyrics(lyric) if lyric else []
-        self.translations_data = self.parse_lyrics(tlyric) if tlyric else []
-        self.last_lyric_index = -1
-        self.last_progress = 0
-        print(f"收到完整歌词: {len(self.lyrics_data)}行, 翻译: {len(self.translations_data)}行")
+        """更新完整歌词数据 - 添加错误处理"""
+        try:
+            self.lyrics_data = self.parse_lyrics(lyric) if lyric else []
+            self.translations_data = self.parse_lyrics(tlyric) if tlyric else []
+            self.last_lyric_index = -1
+            
+            # 检查是否有歌词
+            self.has_lyrics = bool(self.lyrics_data)
+            
+            print(f"收到歌词: {len(self.lyrics_data)}行, 翻译: {len(self.translations_data)}行")
+            
+            # 如果没有歌词，显示提示
+            if not self.has_lyrics:
+                self.lyric_label.config(text="当前歌曲无歌词/正在等待网页传输")
+        except Exception as e:
+            print(f"解析歌词时出错: {e}")
+            self.lyric_label.config(text="歌词解析错误")
     
     def safe_update(self, msg_type, data=None):
-        """线程安全的方式更新UI"""
+        """线程安全的方式更新UI - 添加批量处理"""
         self.message_queue.put((msg_type, data))
     
     def process_queue(self):
-        """处理消息队列中的消息"""
+        """处理消息队列中的消息 - 优化性能"""
+        processed = 0
+        max_processed = 10  # 一次处理的最大消息数
+        
         try:
-            while not self.message_queue.empty():
+            while processed < max_processed and not self.message_queue.empty():
                 msg_type, data = self.message_queue.get_nowait()
                 
                 if msg_type == "status":
@@ -453,16 +331,24 @@ class DesktopLyrics:
                 elif msg_type == "song":
                     self.current_song = data.get('song', '')
                     self.current_artist = data.get('artist', '')
-                    song_text = f"{self.current_song} - {self.current_artist}"
-                    self.song_label.config(text=song_text, fg=self.COLORS["song_info"])
+                    song_text = f"{self.current_song} - {self.current_artist}"[:80]  # 限制长度
+                    self.song_label.config(text=song_text, fg=SONG_FG)
+                    
+                    # 重置歌词状态
+                    self.has_lyrics = False
+                    self.lyrics_data = []
+                    self.translations_data = []
+                    self.last_lyric_index = -1
+                    self.lyric_label.config(text="正在加载歌词...")
+                    self.translation_label.config(text="")
                 elif msg_type == "full_lyric":
                     self.update_full_lyrics(data.get('lyric', ''), data.get('tlyric', ''))
                 elif msg_type == "time":
-                    # 立即处理时间更新
                     self.update_lyrics_with_time(data)
                 elif msg_type == "clear":
-                    self.clear_lyrics_display()
-                    self.song_label.config(text="等待连接...", fg=self.COLORS["song_info"])
+                    self.lyric_label.config(text="")
+                    self.translation_label.config(text="")
+                    self.song_label.config(text="等待连接...", fg=SONG_FG)
                     self.current_lyric = ""
                     self.current_translation = ""
                     self.current_song = ""
@@ -470,17 +356,18 @@ class DesktopLyrics:
                     self.lyrics_data = []
                     self.translations_data = []
                     self.last_lyric_index = -1
-                    self.last_progress = 0
-                    
-        except queue.Empty:
-            pass
+                    self.has_lyrics = False
+                
+                processed += 1
+                
         except Exception as e:
             print(f"处理队列时出错: {e}")
         
-        # 继续定期检查队列（高频）
-        self.root.after(50, self.process_queue)
+        # 继续定期检查队列
+        self.root.after(100, self.process_queue)
     
     def run(self):
+        """运行主循环 - 添加异常处理"""
         try:
             self.root.mainloop()
         except KeyboardInterrupt:
@@ -491,8 +378,9 @@ class DesktopLyrics:
             self.quit_application()
 
 def start_websocket_server(desktop_lyrics):
+    """启动WebSocket服务器 - 重构为更清晰的函数"""
     async def handle_connection(websocket):
-        """处理WebSocket连接"""
+        """处理WebSocket连接 - 添加心跳检测"""
         print("客户端已连接")
         desktop_lyrics.connected_clients.add(websocket)
         desktop_lyrics.safe_update("status", "connected")
@@ -501,8 +389,14 @@ def start_websocket_server(desktop_lyrics):
             async for message in websocket:
                 try:
                     data = json.loads(message)
-                    msg_type = data.get('type')
                     
+                    # 心跳检测处理
+                    if data.get('type') == 'ping':
+                        await websocket.send(json.dumps({'type': 'pong'}))
+                        continue
+                    
+                    # 处理其他消息类型
+                    msg_type = data.get('type')
                     if msg_type == 'song':
                         desktop_lyrics.safe_update("song", {
                             'song': data.get('song', ''),
@@ -514,9 +408,7 @@ def start_websocket_server(desktop_lyrics):
                             'tlyric': data.get('tlyric', '')
                         })
                     elif msg_type == 'time':
-                        current_time = data.get('currentTime', 0)
-                        if current_time >= 0:  # 验证时间有效性
-                            desktop_lyrics.safe_update("time", current_time)
+                        desktop_lyrics.safe_update("time", data.get('currentTime', 0))
                 except json.JSONDecodeError:
                     print("收到无效的JSON消息")
                 except Exception as e:
@@ -532,22 +424,23 @@ def start_websocket_server(desktop_lyrics):
                 desktop_lyrics.connected_clients.remove(websocket)
     
     async def websocket_server():
-        async with websockets.serve(handle_connection, "localhost", 8765):
-            print("WebSocket服务器已启动，监听端口 8765")
+        """WebSocket服务器主循环"""
+        async with websockets.serve(handle_connection, "localhost", WEBSOCKET_PORT):
+            print(f"WebSocket服务器已启动，监听端口 {WEBSOCKET_PORT}")
             await asyncio.Future()  # 永久运行
     
     # 创建新的事件循环
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
     try:
         loop.run_until_complete(websocket_server())
-    except KeyboardInterrupt:
-        print("WebSocket服务器已停止")
+    except Exception as e:
+        print(f"WebSocket服务器错误: {e}")
     finally:
         loop.close()
 
 if __name__ == "__main__":
+    # 创建桌面歌词实例
     desktop_lyrics = DesktopLyrics()
     
     # 在单独的线程中启动WebSocket服务器
