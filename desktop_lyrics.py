@@ -12,13 +12,33 @@ import time
 import math
 import ctypes
 import numpy as np
+from colorsys import hls_to_rgb
 
-# WASAPI 回环（系统内音频）
+# ============ 音频库导入和错误处理 ============
+AUDIO_AVAILABLE = False
+PA = None
+
 try:
     import pyaudiowpatch as pyaudio
-except Exception:
-    pyaudio = None
-    print("开发者调试提示：未找到 pyaudiowpatch，将无法启用系统内音频律动条。安装: pip install pyaudiowpatch")
+    PA = pyaudio
+    AUDIO_AVAILABLE = True
+    print("✅ [develop]成功导入 pyaudiowpatch，系统音频捕获可用")
+except ImportError:
+    print("⚠️  [develop]未找到 pyaudiowpatch，尝试导入标准 PyAudio...")
+    try:
+        import pyaudio
+        PA = pyaudio
+        AUDIO_AVAILABLE = True
+        print("✅ [develop]成功导入标准 PyAudio，麦克风输入可用")
+    except ImportError:
+        print("❌ [develop]未找到 PyAudio，音频功能将不可用")
+        print("安装命令: pip install pyaudiowpatch")
+        AUDIO_AVAILABLE = False
+        PA = None
+except Exception as e:
+    print(f"❌ 导入音频库时出错: {e}")
+    AUDIO_AVAILABLE = False
+    PA = None
 
 # 全局样式
 BG_COLOR = "black"
@@ -36,25 +56,71 @@ WINDOW_ALPHA = 0.85
 HOVER_ALPHA = 0.75
 WEBSOCKET_PORT = 8765
 
-# 卡拉OK参数
-MAX_FPS_MOVING = 120
+# 卡拉OK参数（优化后）
+MAX_FPS_MOVING = 60  # 请根据您的设备刷新率设置
 IDLE_FPS = 10
 PAUSED_FPS = 2
-KARAOKE_FADE_TIME = 0.30
+KARAOKE_FADE_TIME = 0.25  # 从0.30优化到0.25
 KARAOKE_HL_COLOR = "#FFD700"
 KARAOKE_SHIMMER = 0.0
 LAST_LINE_FALLBACK = 3.0
 OUTLINE_SIZE = 1
 OUTLINE_COLOR = "#000000"
-OUTLINE_NEIGHBORS = 4
+OUTLINE_NEIGHBORS = 4  # 从8优化到4
 TIME_FREEZE_ON_STALE_SEC = 0.8
 RENDER_TRANSLATION_ON_CANVAS = True
 TRANSLATION_TOP_GAP = 8
 TRANSLATION_MATCH_WINDOW = 0.6
 
+# 透明色键
 TRANSPARENT_KEY = "#FF00FF"
 
-# ------- Windows 任务栏定位（Macos的先不写awa） -------
+# 颜色LUT步进数
+COLOR_LUT_STEPS = 100
+SHIMMER_LUT_STEPS = 50
+
+# ============ 新增：视觉特效类 ============
+class VisualEffects:
+    """视觉特效管理器"""
+    
+    @staticmethod
+    def gradient_color(start_color, end_color, steps):
+        """生成渐变颜色列表"""
+        start_rgb = tuple(int(start_color[i:i+2], 16) for i in (1, 3, 5))
+        end_rgb = tuple(int(end_color[i:i+2], 16) for i in (1, 3, 5))
+        
+        colors = []
+        for i in range(steps):
+            r = int(start_rgb[0] + (end_rgb[0] - start_rgb[0]) * i / steps)
+            g = int(start_rgb[1] + (end_rgb[1] - start_rgb[1]) * i / steps)
+            b = int(start_rgb[2] + (end_rgb[2] - start_rgb[2]) * i / steps)
+            colors.append(f"#{r:02x}{g:02x}{b:02x}")
+        return colors
+    
+    @staticmethod
+    def rainbow_color(position):
+        """彩虹色生成器"""
+        r = int(255 * abs(math.sin(position)))
+        g = int(255 * abs(math.sin(position + math.pi/3)))
+        b = int(255 * abs(math.sin(position + 2*math.pi/3)))
+        return f"#{r:02x}{g:02x}{b:02x}"
+    
+    @staticmethod
+    def pulse_color(base_color, intensity):
+        """脉冲颜色效果"""
+        r, g, b = tuple(int(base_color[i:i+2], 16) for i in (1, 3, 5))
+        r = min(255, int(r * (1 + intensity * 0.3)))
+        g = min(255, int(g * (1 + intensity * 0.3)))
+        b = min(255, int(b * (1 + intensity * 0.3)))
+        return f"#{r:02x}{g:02x}{b:02x}"
+    
+    @staticmethod
+    def hsl_color(hue, saturation=0.8, lightness=0.7):
+        """HSL颜色生成"""
+        r, g, b = [int(c * 255) for c in hls_to_rgb(hue, lightness, saturation)]
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+# ------- Windows 任务栏定位 -------
 class RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long),
                 ("top", ctypes.c_long),
@@ -83,69 +149,208 @@ def _detect_taskbar_edge():
     else:
         return ("bottom", r)
 
-# ------- 音频线程（WASAPI 回环） -------
+# ============ 改进的音频线程 ============
 class _AudioWorker:
     def __init__(self, num_bars, on_levels, stop_event: threading.Event):
         self.num_bars = num_bars
         self.on_levels = on_levels
         self.stop_event = stop_event
+        
         # 灵敏度与手感
         self.min_db = -20.0
         self.max_db = 70.0
         self.smooth_alpha = 0.65
         self.peak_decay = 1.0
+        
+        # 音频设备
         self.p = None
         self.stream = None
         self.rate = 48000
         self.chunk = 2048
         self.band_idx = None
         self.freqs = None
+        
+        # 显示数据
         self.display_levels = np.zeros(self.num_bars, dtype=np.float32)
+        
+        # 限流控制
+        self._update_throttle = 0.033  # 最多30Hz更新UI
+        self._last_update = 0.0
+        
+        # 模拟模式标志
+        self.simulation_mode = False
+        self.simulation_time = 0.0
+        self.simulation_freq = 0.0
 
-    def _open_loopback_stream(self):
-        self.p = pyaudio.PyAudio()
+    def _open_audio_stream(self):
+        """尝试打开音频流，支持多种回退方案"""
+        if not AUDIO_AVAILABLE or PA is None:
+            print("⚠️  [develop]音频库不可用，启用模拟模式")
+            self.simulation_mode = True
+            return False
+        
         try:
-            wasapi_info = self.p.get_host_api_info_by_type(pyaudio.paWASAPI)
-        except Exception:
-            raise RuntimeError("未检测到 WASAPI，无法捕获系统内音频。")
+            self.p = PA.PyAudio()
+            print(f"✅ [develop]成功初始化 PyAudio，版本: {PA.__version__}")
+            
+            # 列出所有可用设备
+            print("\n=== 可用音频设备 ===")
+            for i in range(self.p.get_device_count()):
+                try:
+                    dev_info = self.p.get_device_info_by_index(i)
+                    print(f"[{i}] {dev_info['name']}")
+                    print(f"   输入通道: {dev_info['maxInputChannels']}, 输出通道: {dev_info['maxOutputChannels']}")
+                    print(f"   默认采样率: {dev_info['defaultSampleRate']}")
+                except:
+                    pass
+            print("===================\n")
+            
+            # 尝试多种打开方式
+            stream_methods = [
+                self._try_wasapi_loopback,
+                self._try_default_input,
+                self._try_any_input_device
+            ]
+            
+            for method in stream_methods:
+                try:
+                    stream = method()
+                    if stream:
+                        print(f"✅ [develop]成功使用 {method.__name__} 打开音频流")
+                        self.stream = stream
+                        return True
+                except Exception as e:
+                    print(f"⚠️  {method.__name__} 失败: {e}")
+                    continue
+            
+            print("❌ [develop]所有音频打开方式都失败，启用模拟模式")
+            self.simulation_mode = True
+            return False
+            
+        except Exception as e:
+            print(f"❌ [develop]PyAudio 初始化失败: {e}")
+            self.simulation_mode = True
+            return False
 
-        default_out = self.p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
-        rate = int(default_out.get("defaultSampleRate", 48000)) or 48000
-        # 优先尝试对默认输出使用 as_loopback=True（更通用）
+    def _try_wasapi_loopback(self):
+        """尝试使用WASAPI回环捕获系统音频"""
         try:
-            stream = self.p.open(format=pyaudio.paInt16,
-                                 channels=min(2, int(default_out.get("maxOutputChannels", 2)) or 2),
-                                 rate=rate,
-                                 input=True,
-                                 frames_per_buffer=self.chunk,
-                                 input_device_index=default_out["index"],
-                                 as_loopback=True)
+            wasapi_info = self.p.get_host_api_info_by_type(PA.paWASAPI)
+            print(f"✅ [develop]检测到 WASAPI，默认输出设备索引: {wasapi_info['defaultOutputDevice']}")
+            
+            # 获取默认输出设备信息
+            default_out = self.p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+            rate = int(default_out.get("defaultSampleRate", 48000)) or 48000
+            
+            print(f"📊 [develop]设备信息:")
+            print(f"   名称: {default_out['name']}")
+            print(f"   采样率: {rate} Hz")
+            print(f"   输出通道数: {default_out.get('maxOutputChannels', 2)}")
+            
+            # 尝试直接打开回环流
+            try:
+                stream = self.p.open(
+                    format=PA.paInt16,
+                    channels=min(2, int(default_out.get("maxOutputChannels", 2))),
+                    rate=rate,
+                    input=True,
+                    frames_per_buffer=self.chunk,
+                    input_device_index=default_out["index"],
+                    as_loopback=True
+                )
+                self.rate = rate
+                return stream
+            except Exception as e:
+                print(f"⚠️  [develop]直接回环失败: {e}")
+                
+            # 尝试查找回环设备
+            print("🔍 [develop]搜索回环设备...")
+            for i in range(self.p.get_device_count()):
+                try:
+                    dev_info = self.p.get_device_info_by_index(i)
+                    if "loopback" in dev_info['name'].lower() or "立体声混音" in dev_info['name']:
+                        print(f"✅ [develop]找到回环设备: {dev_info['name']}")
+                        rate = int(dev_info["defaultSampleRate"])
+                        channels = min(2, int(dev_info.get("maxInputChannels", 2)))
+                        
+                        stream = self.p.open(
+                            format=PA.paInt16,
+                            channels=channels,
+                            rate=rate,
+                            input=True,
+                            frames_per_buffer=self.chunk,
+                            input_device_index=i
+                        )
+                        self.rate = rate
+                        return stream
+                except:
+                    continue
+                    
+            return None
+            
+        except Exception as e:
+            print(f"⚠️  [develop]WASAPI 检测失败: {e}")
+            return None
+
+    def _try_default_input(self):
+        """尝试打开默认输入设备"""
+        try:
+            # 获取默认输入设备
+            default_input = self.p.get_default_input_device_info()
+            rate = int(default_input.get("defaultSampleRate", 48000))
+            channels = min(2, int(default_input.get("maxInputChannels", 1)))
+            
+            print(f"🎤 [develop]使用默认输入设备: {default_input['name']}")
+            print(f"   [develop]采样率: {rate} Hz, 通道数: {channels}")
+            
+            stream = self.p.open(
+                format=PA.paInt16,
+                channels=channels,
+                rate=rate,
+                input=True,
+                frames_per_buffer=self.chunk,
+                input_device_index=default_input["index"]
+            )
             self.rate = rate
             return stream
-        except Exception:
-            pass
+            
+        except Exception as e:
+            print(f"⚠️  [develop]默认输入设备失败: {e}")
+            return None
 
-        # 退回：枚举 loopback 设备
-        loopback = None
-        for lb in self.p.get_loopback_device_info_generator():
-            loopback = lb
-            if default_out["name"] in lb["name"]:
-                break
-        if loopback is None:
-            raise RuntimeError("未找到回放(Loopback)设备。")
-
-        rate = int(loopback["defaultSampleRate"])
-        channels = min(2, int(loopback.get("maxInputChannels", 2)) or 2)
-        stream = self.p.open(format=pyaudio.paInt16,
-                             channels=channels,
-                             rate=rate,
-                             input=True,
-                             frames_per_buffer=self.chunk,
-                             input_device_index=loopback["index"])
-        self.rate = rate
-        return stream
+    def _try_any_input_device(self):
+        """尝试打开任何可用的输入设备"""
+        try:
+            for i in range(self.p.get_device_count()):
+                try:
+                    dev_info = self.p.get_device_info_by_index(i)
+                    if dev_info.get("maxInputChannels", 0) > 0:
+                        rate = int(dev_info.get("defaultSampleRate", 48000))
+                        channels = min(2, int(dev_info.get("maxInputChannels", 1)))
+                        
+                        print(f"🔊 [develop]尝试输入设备 [{i}]: {dev_info['name']}")
+                        
+                        stream = self.p.open(
+                            format=PA.paInt16,
+                            channels=channels,
+                            rate=rate,
+                            input=True,
+                            frames_per_buffer=self.chunk,
+                            input_device_index=i
+                        )
+                        self.rate = rate
+                        return stream
+                except Exception as e:
+                    continue
+                    
+            return None
+            
+        except Exception as e:
+            print(f"⚠️  [develop]所有输入设备尝试失败: {e}")
+            return None
 
     def _prepare_fft_bands(self):
+        """准备FFT频带"""
         self.freqs = np.fft.rfftfreq(self.chunk, d=1.0 / self.rate)
         f_min, f_max = 20.0, min(20000.0, self.rate / 2.0)
         edges = np.geomspace(f_min, f_max, self.num_bars + 1)
@@ -159,41 +364,118 @@ class _AudioWorker:
                 sel = np.array([nearest], dtype=int)
             self.band_idx.append(sel)
 
+    def _generate_simulation_data(self):
+        """生成模拟音频数据"""
+        self.simulation_time += 0.05
+        self.simulation_freq = 5.0 + 4.0 * math.sin(self.simulation_time * 0.3)
+        
+        # 生成随机频谱数据
+        np.random.seed(int(self.simulation_time * 10))
+        base = np.random.randn(self.num_bars) * 0.3
+        
+        # 添加正弦波模式
+        for i in range(self.num_bars):
+            freq = 0.1 + 0.9 * (i / self.num_bars)
+            base[i] += 0.5 * math.sin(self.simulation_time * freq * self.simulation_freq)
+        
+        # 归一化到0-1范围
+        levels = (base - base.min()) / (base.max() - base.min() + 1e-10)
+        
+        # 添加随机峰值
+        if np.random.random() < 0.1:
+            peak_pos = np.random.randint(0, self.num_bars)
+            levels[peak_pos] = 1.0
+        
+        return levels.astype(np.float32)
+
     def run(self):
-        try:
-            self.stream = self._open_loopback_stream()
-        except Exception as e:
-            print(f"[律动条] 音频初始化失败：{e}")
-            return
-        self._prepare_fft_bands()
-        window = np.hanning(self.chunk).astype(np.float32)
+        """音频处理主循环"""
+        # 尝试打开音频设备
+        if not self._open_audio_stream():
+            print("🎵 [develop]进入模拟模式，律动条将显示模拟波形")
+            self.simulation_mode = True
+        
+        # 如果是真实音频模式，准备FFT
+        if not self.simulation_mode and self.stream:
+            self._prepare_fft_bands()
+            window = np.hanning(self.chunk).astype(np.float32)
+        
+        print("▶️  [develop]开始音频处理循环...")
+        
         while not self.stop_event.is_set():
             try:
-                buf = self.stream.read(self.chunk, exception_on_overflow=False)
-            except Exception:
-                continue
-            data = np.frombuffer(buf, dtype=np.int16).astype(np.float32) / 32768.0
-            if getattr(self.stream, "_channels", 1) >= 2:
-                try:
-                    data = data.reshape(-1, self.stream._channels).mean(axis=1)
-                except Exception:
-                    pass
-            x = data[:self.chunk] * window
-            spec = np.fft.rfft(x)
-            mag = np.abs(spec) + 1e-10
-            db = 20.0 * np.log10(mag)
-            band_vals = np.empty(self.num_bars, dtype=np.float32)
-            for i, sel in enumerate(self.band_idx):
-                band_vals[i] = db[sel].max()
-            levels = (band_vals - self.min_db) / (self.max_db - self.min_db)
-            levels = np.clip(levels, 0.0, 1.0)
-            prev = self.display_levels
-            up = np.maximum(levels, prev * (1.0 - self.peak_decay))
-            smoothed = self.smooth_alpha * prev + (1.0 - self.smooth_alpha) * up
-            self.display_levels = smoothed
-            self.on_levels(self.display_levels.copy())
+                if self.simulation_mode:
+                    # 模拟模式：生成模拟数据
+                    levels = self._generate_simulation_data()
+                    self.display_levels = levels
+                    
+                    # 限流控制
+                    now_t = time.perf_counter()
+                    if now_t - self._last_update >= self._update_throttle:
+                        self._last_update = now_t
+                        self.on_levels(self.display_levels.copy())
+                    
+                    time.sleep(self._update_throttle)
+                    
+                elif self.stream:
+                    # 真实音频模式
+                    try:
+                        buf = self.stream.read(self.chunk, exception_on_overflow=False)
+                    except Exception as e:
+                        print(f"⚠️  [develop]读取音频流失败: {e}")
+                        time.sleep(0.1)
+                        continue
+                    
+                    data = np.frombuffer(buf, dtype=np.int16).astype(np.float32) / 32768.0
+                    
+                    # 处理多声道音频
+                    if getattr(self.stream, "_channels", 1) >= 2:
+                        try:
+                            data = data.reshape(-1, self.stream._channels).mean(axis=1)
+                        except Exception:
+                            pass
+                    
+                    x = data[:self.chunk] * window
+                    spec = np.fft.rfft(x)
+                    mag = np.abs(spec) + 1e-10
+                    db = 20.0 * np.log10(mag)
+                    
+                    # 计算频带值
+                    band_vals = np.empty(self.num_bars, dtype=np.float32)
+                    for i, sel in enumerate(self.band_idx):
+                        band_vals[i] = db[sel].max()
+                    
+                    levels = (band_vals - self.min_db) / (self.max_db - self.min_db)
+                    levels = np.clip(levels, 0.0, 1.0)
+                    
+                    # 平滑处理
+                    prev = self.display_levels
+                    up = np.maximum(levels, prev * (1.0 - self.peak_decay))
+                    smoothed = self.smooth_alpha * prev + (1.0 - self.smooth_alpha) * up
+                    self.display_levels = smoothed
+                    
+                    # 限流控制
+                    now_t = time.perf_counter()
+                    if now_t - self._last_update >= self._update_throttle:
+                        self._last_update = now_t
+                        self.on_levels(self.display_levels.copy())
+                        
+                else:
+                    # 无可用音频设备
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                print(f"⚠️  [develop]音频处理异常: {e}")
+                time.sleep(0.1)
+        
+        # 清理资源
+        self._cleanup()
+
+    def _cleanup(self):
+        """清理音频资源"""
+        print("🧹 [develop]清理音频资源...")
         try:
-            if self.stream and self.stream.is_active():
+            if self.stream and hasattr(self.stream, 'is_active') and self.stream.is_active():
                 self.stream.stop_stream()
         except Exception:
             pass
@@ -208,30 +490,35 @@ class _AudioWorker:
         except Exception:
             pass
 
-# ------- 透明、贴任务栏的律动条覆盖层 -------
+# ============ 优化后的律动条 ============
 class VisualizerOverlay:
     def __init__(self, root):
         self.root = root
         self.win = tk.Toplevel(self.root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-
-        # 用统一色键作为背景，后续用 Win32 抠掉这类像素
         self.win.configure(bg=TRANSPARENT_KEY)
         try:
             self.win.attributes("-transparentcolor", TRANSPARENT_KEY)
         except Exception:
             pass
 
-        # 任务栏贴边定位
         edge, tb_rect = _detect_taskbar_edge()
         screen_w, screen_h = _get_screen_size()
-        self.strip_height_px = 72
-        self.side_strip_px = 120
-        self.bar_spacing_px = 2
+        
+        # 优化参数
+        self.strip_height_px = 80  # 增加高度
+        self.side_strip_px = 140
+        self.bar_spacing_px = 1  # 减小间距
         self.min_bar_px = 2
-        self.bar_color = "#00ff7f"
-
+        
+        # 动态颜色参数
+        self.color_mode = "gradient"  # gradient, rainbow, pulse, single
+        self.base_color = "#00ff7f"
+        self.gradient_colors = VisualEffects.gradient_color("#00ff7f", "#ff007f", 100)
+        self.rainbow_offset = 0.0
+        self.pulse_phase = 0.0
+        
         if edge in ("bottom", "top"):
             win_w = screen_w
             win_h = self.strip_height_px
@@ -245,40 +532,47 @@ class VisualizerOverlay:
 
         self.vertical_layout = (win_h > win_w)
         self.win.geometry(f"{win_w}x{win_h}+{x}+{y}")
-
-        # 画布背景也用透明键色，避免出现可见背景
         self.canvas = tk.Canvas(self.win, width=win_w, height=win_h,
                                 bg=TRANSPARENT_KEY, highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
-
         self.win.update_idletasks()
-        self._apply_click_through_and_colorkey()  # 鼠标穿透 + 颜色键
+        self._apply_click_through_and_colorkey()
 
-        # 柱条布局
+        # 计算条形数量和大小
         if not self.vertical_layout:
             full = self.min_bar_px + self.bar_spacing_px
-            self.num_bars = min(max(64, win_w // max(1, full)), 240)
+            self.num_bars = min(max(80, win_w // max(1, full)), 320)  # 增加数量
             total_spacing = (self.num_bars + 1) * self.bar_spacing_px
             avail = max(1, win_w - total_spacing)
             self.bar_w = max(self.min_bar_px, avail // self.num_bars)
             self.bar_h = win_h
         else:
             full = self.min_bar_px + self.bar_spacing_px
-            self.num_bars = min(max(64, win_h // max(1, full)), 240)
+            self.num_bars = min(max(80, win_h // max(1, full)), 320)
             total_spacing = (self.num_bars + 1) * self.bar_spacing_px
             avail = max(1, win_h - total_spacing)
             self.bar_w = max(self.min_bar_px, (win_w - 2 * self.bar_spacing_px))
             self.bar_h = max(self.min_bar_px, avail // self.num_bars)
 
-        # 预创建矩形（初始高度/宽度为 0）
+        # 创建条形
         self.bars = []
+        self.glow_bars = []  # 发光效果层
+        
         if not self.vertical_layout:
             for i in range(self.num_bars):
                 x1 = self.bar_spacing_px + i * (self.bar_w + self.bar_spacing_px)
                 x2 = x1 + self.bar_w
                 y2 = win_h
                 y1 = y2
-                r = self.canvas.create_rectangle(x1, y1, x2, y2, fill=self.bar_color, width=0)
+                # 发光层
+                glow = self.canvas.create_rectangle(
+                    x1 - 1, y1 - 1, x2 + 1, y2 + 1,
+                    fill="#4A90E2", width=0, state='hidden'
+                )
+                self.glow_bars.append(glow)
+                # 主条形
+                r = self.canvas.create_rectangle(x1, y1, x2, y2, 
+                                                 fill=self.base_color, width=0)
                 self.bars.append(r)
         else:
             for i in range(self.num_bars):
@@ -286,28 +580,132 @@ class VisualizerOverlay:
                 y2 = y1 + self.bar_h
                 x1 = 0
                 x2 = 0
-                r = self.canvas.create_rectangle(x1, y1, x2, y2, fill=self.bar_color, width=0)
+                # 发光层
+                glow = self.canvas.create_rectangle(
+                    x1 - 1, y1 - 1, x2 + 1, y2 + 1,
+                    fill="#4A90E2", width=0, state='hidden'
+                )
+                self.glow_bars.append(glow)
+                # 主条形
+                r = self.canvas.create_rectangle(x1, y1, x2, y2, 
+                                                 fill=self.base_color, width=0)
                 self.bars.append(r)
 
-        # 音频线程
+        # 音频处理
         self._stop_evt = threading.Event()
         self.worker = None
         self.thread = None
         self._running = False
-        if pyaudio is not None:
-            self._start_audio()
-
+        
+        # 历史数据用于平滑
+        self.last_levels = np.zeros(self.num_bars, dtype=np.float32)
+        self.peak_levels = np.zeros(self.num_bars, dtype=np.float32)
+        
+        # 尝试启动音频
+        self._start_audio()
+            
         self.alive = True
         self._visible = True
+        
+        # 启动颜色动画
+        self.rainbow_speed = 0.02
+        self.pulse_speed = 0.05
+        self._animate_colors()
+
+    def _animate_colors(self):
+        """颜色动画循环"""
+        if self.alive and self._visible:
+            self.rainbow_offset = (self.rainbow_offset + self.rainbow_speed) % 1.0
+            self.pulse_phase = (self.pulse_phase + self.pulse_speed) % (2 * math.pi)
+        self.win.after(50, self._animate_colors)
+
+    def _get_bar_color(self, i, level):
+        """根据模式和位置获取条形颜色"""
+        if self.color_mode == "gradient":
+            color_idx = min(int(level * (len(self.gradient_colors) - 1)), 
+                          len(self.gradient_colors) - 1)
+            return self.gradient_colors[color_idx]
+        elif self.color_mode == "rainbow":
+            position = (i / self.num_bars + self.rainbow_offset) % 1.0
+            return VisualEffects.rainbow_color(position * 2 * math.pi)
+        elif self.color_mode == "pulse":
+            intensity = (math.sin(self.pulse_phase) + 1) * 0.5
+            return VisualEffects.pulse_color(self.base_color, intensity * level)
+        else:
+            return self.base_color
+
+    def _update_bars(self, levels):
+        if not self.alive or not self._visible:
+            return
+            
+        # 应用平滑
+        smooth_levels = 0.7 * levels + 0.3 * self.last_levels
+        self.last_levels = smooth_levels
+        
+        # 更新峰值
+        self.peak_levels = np.maximum(smooth_levels * 0.9, self.peak_levels * 0.98)
+        
+        canvas_w = int(self.canvas.winfo_width())
+        canvas_h = int(self.canvas.winfo_height())
+        
+        if not self.vertical_layout:
+            for i, lv in enumerate(smooth_levels):
+                # 主条形高度
+                bh = int(lv * canvas_h * 1.1)  # 增加幅度
+                x1 = self.bar_spacing_px + i * (self.bar_w + self.bar_spacing_px)
+                x2 = x1 + self.bar_w
+                y2 = canvas_h
+                y1 = max(0, y2 - bh)
+                
+                # 峰值条形（半透明）
+                peak_h = int(self.peak_levels[i] * canvas_h)
+                peak_y1 = max(0, y2 - peak_h)
+                
+                # 更新主条形
+                self.canvas.coords(self.bars[i], x1, y1, x2, y2)
+                
+                # 设置颜色
+                color = self._get_bar_color(i, lv)
+                self.canvas.itemconfig(self.bars[i], fill=color)
+                
+                # 控制发光效果
+                if lv > 0.7:
+                    self.canvas.itemconfig(self.glow_bars[i], state='normal')
+                    glow_y1 = max(0, y2 - bh - 2)
+                    self.canvas.coords(self.glow_bars[i], 
+                                      x1 - 2, glow_y1, x2 + 2, y2 + 2)
+                else:
+                    self.canvas.itemconfig(self.glow_bars[i], state='hidden')
+        else:
+            for i, lv in enumerate(smooth_levels):
+                bw = int(lv * canvas_w * 1.1)
+                y1 = self.bar_spacing_px + i * (self.bar_h + self.bar_spacing_px)
+                y2 = y1 + self.bar_h
+                x2 = canvas_w
+                x1 = max(0, x2 - bw)
+                
+                # 更新主条形
+                self.canvas.coords(self.bars[i], x1, y1, x2, y2)
+                
+                # 设置颜色
+                color = self._get_bar_color(i, lv)
+                self.canvas.itemconfig(self.bars[i], fill=color)
+                
+                # 控制发光效果
+                if lv > 0.7:
+                    self.canvas.itemconfig(self.glow_bars[i], state='normal')
+                    glow_x1 = max(0, x2 - bw - 2)
+                    self.canvas.coords(self.glow_bars[i], 
+                                      glow_x1, y1 - 2, x2 + 2, y2 + 2)
+                else:
+                    self.canvas.itemconfig(self.glow_bars[i], state='hidden')
 
     def _apply_click_through_and_colorkey(self):
-        # 顶层和 Canvas 都设置分层+透明命中，并设置颜色键（与 Tk 的 -transparentcolor 一致）
         GWL_EXSTYLE = -20
         WS_EX_TRANSPARENT = 0x00000020
         WS_EX_LAYERED = 0x00080000
         WS_EX_TOOLWINDOW = 0x00000080
         LWA_COLORKEY = 0x00000001
-
         user32 = ctypes.windll.user32
         GetWindowLong = user32.GetWindowLongW
         SetWindowLong = user32.SetWindowLongW
@@ -317,7 +715,6 @@ class VisualizerOverlay:
         SWP_NOSIZE = 0x0001
         SWP_NOZORDER = 0x0004
         SWP_FRAMECHANGED = 0x0020
-
         col = TRANSPARENT_KEY.lstrip("#")
         r, g, b = int(col[0:2], 16), int(col[2:4], 16), int(col[4:6], 16)
         colorref = r | (g << 8) | (b << 16)
@@ -338,22 +735,18 @@ class VisualizerOverlay:
             _apply(self.canvas.winfo_id())
         except Exception:
             pass
-
         self._apply_click_through_to_all_children()
 
     def _apply_click_through_to_all_children(self):
-        # 防御性地把所有子窗口都设置为穿透+颜色键，避免某些系统拦截事件
         EnumChildWindows = ctypes.windll.user32.EnumChildWindows
         GetWindowLong = ctypes.windll.user32.GetWindowLongW
         SetWindowLong = ctypes.windll.user32.SetWindowLongW
         SetLayeredWindowAttributes = ctypes.windll.user32.SetLayeredWindowAttributes
-
         GWL_EXSTYLE = -20
         WS_EX_TRANSPARENT = 0x00000020
         WS_EX_LAYERED = 0x00080000
         WS_EX_TOOLWINDOW = 0x00000080
         LWA_COLORKEY = 0x00000001
-
         col = TRANSPARENT_KEY.lstrip("#")
         r, g, b = int(col[0:2], 16), int(col[2:4], 16), int(col[4:6], 16)
         colorref = r | (g << 8) | (b << 16)
@@ -375,7 +768,7 @@ class VisualizerOverlay:
             pass
 
     def _start_audio(self):
-        if self._running or pyaudio is None:
+        if self._running or not AUDIO_AVAILABLE:
             return
         self._stop_evt.clear()
 
@@ -399,32 +792,10 @@ class VisualizerOverlay:
             pass
         self._running = False
 
-    def _update_bars(self, levels):
-        if not self.alive or not self._visible:
-            return
-        if not self.vertical_layout:
-            h = int(self.canvas.winfo_height())
-            for i, lv in enumerate(levels):
-                bh = int(lv * h)
-                x1 = self.bar_spacing_px + i * (self.bar_w + self.bar_spacing_px)
-                x2 = x1 + self.bar_w
-                y2 = h
-                y1 = max(0, y2 - bh)
-                self.canvas.coords(self.bars[i], x1, y1, x2, y2)
-        else:
-            w = int(self.canvas.winfo_width())
-            for i, lv in enumerate(levels):
-                bw = int(lv * w)
-                y1 = self.bar_spacing_px + i * (self.bar_h + self.bar_spacing_px)
-                y2 = y1 + self.bar_h
-                x2 = w
-                x1 = max(0, x2 - bw)
-                self.canvas.coords(self.bars[i], x1, y1, x2, y2)
-
     def show(self):
         self.win.deiconify()
         self.win.lift()
-        self._apply_click_through_and_colorkey()  # 有些系统隐藏/显示后需要重置样式
+        self._apply_click_through_and_colorkey()
         self._start_audio()
         self._visible = True
 
@@ -443,7 +814,7 @@ class VisualizerOverlay:
         except Exception:
             pass
 
-# ------- 歌词主窗口 -------
+# ------- 歌词主窗口（优化版）-------
 class DesktopLyrics:
     TIME_TAG_RE = re.compile(r"\[(\d{1,2}):(\d{1,2})(?:[.:](\d{1,3}))?\]")
 
@@ -494,10 +865,12 @@ class DesktopLyrics:
         self._last_sync_time = 0.0
         self._last_sync_mono = time.perf_counter()
 
-        # 布局缓存
+        # 🔥 优化：布局缓存 + 智能脏标记
         self.current_line_start = 0.0
         self.next_line_start = 0.0
-        self._need_layout = True
+        self._layout_dirty = True
+        self._items_dirty = True
+        self._last_lyric_hash = None
         self._line_positions = []
         self._line_width = 0
         self._char_items = []
@@ -505,17 +878,23 @@ class DesktopLyrics:
         self._trans_item = None
         self._trans_outline_items = []
 
+        # 🔥 优化：预计算颜色LUT
+        self._color_lut = self._build_color_lut(LYRIC_FG, KARAOKE_HL_COLOR, COLOR_LUT_STEPS)
+        self._shimmer_lut = self._build_color_lut(KARAOKE_HL_COLOR, "#FFFFFF", SHIMMER_LUT_STEPS)
+
         # 动画循环
         self.root.after(self._frame_delay_ms(IDLE_FPS), self.animation_tick)
 
-        # 启动律动条（默认开）
-        if self.visualizer_enabled and pyaudio is not None:
+        # 启动律动条
+        if self.visualizer_enabled:
             try:
                 self.visualizer = VisualizerOverlay(self.root)
                 self.visualizer.show()
             except Exception as e:
                 print(f"创建律动条失败：{e}")
+                print("律动条将不可用，但歌词功能正常")
                 self.visualizer = None
+                self.visualizer_enabled = False
 
     def _build_fonts(self):
         self.lyric_font = tkfont.Font(family=FONT_NAME, size=LYRIC_FONT_SIZE, weight="bold")
@@ -525,7 +904,7 @@ class DesktopLyrics:
     def _build_ui(self):
         self.main_frame = tk.Frame(self.root, bg=BG_COLOR)
         self.main_frame.pack(fill="both", expand=True, padx=20, pady=10)
-        self.song_label = tk.Label(self.main_frame, text="等待连接...", font=self.song_font,
+        self.song_label = tk.Label(self.main_frame, text="等待连接... Harmonia桌面歌词", font=self.song_font,
                                    fg=SONG_FG, bg=BG_COLOR, pady=8)
         self.song_label.pack(anchor="center")
         self.lyric_canvas = tk.Canvas(self.main_frame, bg=BG_COLOR, highlightthickness=0)
@@ -540,6 +919,25 @@ class DesktopLyrics:
         self.root.bind("<Enter>", self._on_enter)
         self.root.bind("<Leave>", self._on_leave)
         self.root.attributes("-alpha", WINDOW_ALPHA)
+
+    # 🔥 优化：预计算颜色LUT
+    def _build_color_lut(self, color_a, color_b, steps):
+        """预计算颜色渐变查找表"""
+        a = self._hex_to_rgb(color_a)
+        b = self._hex_to_rgb(color_b)
+        lut = []
+        for i in range(steps + 1):
+            t = i / steps
+            eased_t = t * t * (3 - 2 * t)  # 预先计算缓动函数
+            rgb = tuple(int(round(a[j] + (b[j] - a[j]) * eased_t)) for j in range(3))
+            lut.append(self._rgb_to_hex(rgb))
+        return lut
+
+    def _get_color_from_lut(self, progress, lut):
+        """从LUT快速获取颜色（零计算）"""
+        progress = max(0.0, min(1.0, progress))
+        idx = int(progress * (len(lut) - 1))
+        return lut[idx]
 
     # 交互
     def _on_enter(self, _):
@@ -570,7 +968,8 @@ class DesktopLyrics:
     def _toggle_karaoke(self, *_):
         def _do():
             self.karaoke_enabled = not self.karaoke_enabled
-            self._need_layout = True
+            self._layout_dirty = True
+            self._items_dirty = True
             self._prepare_line_layout()
             self._rebuild_items()
             self._update_tray_menu()
@@ -580,19 +979,16 @@ class DesktopLyrics:
         def _do():
             self.visualizer_enabled = not self.visualizer_enabled
             if self.visualizer_enabled:
-                if pyaudio is None:
-                    print("律动条无法启用：缺少 pyaudiowpatch。请安装：pip install pyaudiowpatch")
-                    self.visualizer_enabled = False
-                else:
-                    if self.visualizer is None:
-                        try:
-                            self.visualizer = VisualizerOverlay(self.root)
-                        except Exception as e:
-                            print(f"创建律动条失败：{e}")
-                            self.visualizer = None
-                            self.visualizer_enabled = False
-                    if self.visualizer:
+                if self.visualizer is None:
+                    try:
+                        self.visualizer = VisualizerOverlay(self.root)
                         self.visualizer.show()
+                    except Exception as e:
+                        print(f"创建律动条失败：{e}")
+                        self.visualizer = None
+                        self.visualizer_enabled = False
+                else:
+                    self.visualizer.show()
             else:
                 if self.visualizer:
                     self.visualizer.hide()
@@ -640,10 +1036,13 @@ class DesktopLyrics:
             draw.polygon(points, fill="#E6E6FA")
             self.tray_menu = pystray.Menu(
                 pystray.MenuItem(lambda _: "解锁" if self.is_locked else "锁定", self._toggle_lock),
+                # 新增的提示按钮
+                pystray.MenuItem("温馨提示：下面两个功能以视觉为主，由于屎山代码，因此并没有什么优化，请谨慎开启", 
+                                lambda _: None, enabled=False),
                 pystray.MenuItem(lambda _: f"逐字渐变：{'开' if self.karaoke_enabled else '关'}",
-                                 self._toggle_karaoke),
+                                self._toggle_karaoke),
                 pystray.MenuItem(lambda _: f"律动条：{'开' if self.visualizer_enabled else '关'}",
-                                 self._toggle_visualizer),
+                                self._toggle_visualizer),
                 pystray.MenuItem("断开连接", self._disconnect_client),
                 pystray.MenuItem("退出", self._quit)
             )
@@ -683,9 +1082,9 @@ class DesktopLyrics:
     def update_status(self, status):
         self.connection_status = status
         if status == "connected":
-            self.song_label.config(text="已连接 - 等待歌曲...", fg=SONG_FG)
+            self.song_label.config(text="已连接至网页 - 等待传输歌曲... Harmonia桌面歌词", fg=SONG_FG)
         elif status == "disconnected":
-            self.song_label.config(text="等待连接...", fg=SONG_FG)
+            self.song_label.config(text="等待连接... Harmonia桌面歌词", fg=SONG_FG)
 
     # 解析歌词
     def _normalize_lyric_payload(self, payload):
@@ -740,16 +1139,17 @@ class DesktopLyrics:
             return self._last_sync_time
         return self._last_sync_time + dt
 
-    # 布局缓存
+    # 🔥 优化：智能脏标记
     def invalidate_layout(self):
-        self._need_layout = True
+        """仅标记脏，不立即处理"""
+        self._layout_dirty = True
 
     def _prepare_line_layout(self):
         s = self.current_lyric or ""
         if not s:
             self._line_positions = []
             self._line_width = 0
-            self._need_layout = False
+            self._layout_dirty = False
             return
         canvas_w = max(1, self.lyric_canvas.winfo_width())
         widths = [self.lyric_font.measure(ch) for ch in s]
@@ -762,7 +1162,7 @@ class DesktopLyrics:
                 x += w
         self._line_positions = pos
         self._line_width = total_w
-        self._need_layout = False
+        self._layout_dirty = False
 
     def _build_outline_offsets(self):
         o = OUTLINE_SIZE
@@ -848,7 +1248,7 @@ class DesktopLyrics:
                 tx, ty, text=trans, fill=TRANSLATION_FG, font=self.translation_font, anchor="nw"
             )
 
-    # 逻辑更新
+    # 🔥 优化：逻辑更新 + 智能脏标记
     def update_lyrics_with_time(self, current_time):
         if not hasattr(self, "last_translation_index"):
             self.last_translation_index = -1
@@ -871,10 +1271,8 @@ class DesktopLyrics:
                 self.next_line_start = self.lyrics_data[current_index + 1]['time']
             else:
                 self.next_line_start = self.current_line_start + LAST_LINE_FALLBACK
-            self._need_layout = True
             line_changed = True
 
-        # 翻译与主行时间接近才显示
         if self.translations_data and current_index != -1:
             target_t = self.lyrics_data[current_index]['time']
             best_idx = -1
@@ -904,15 +1302,23 @@ class DesktopLyrics:
                 self.translation_label.config(text="")
                 line_changed = True
 
-        if line_changed or self._need_layout:
+        # 🔥 仅在内容真正变化时重建
+        new_hash = hash((self.current_lyric, self.current_translation))
+        if new_hash != self._last_lyric_hash:
+            self._last_lyric_hash = new_hash
+            self._layout_dirty = True
+            self._items_dirty = True
+
+        if self._layout_dirty:
             self._prepare_line_layout()
+            self._layout_dirty = False
+            self._items_dirty = True
+
+        if self._items_dirty:
             self._rebuild_items()
+            self._items_dirty = False
 
-    # 渲染
-    def _ease_in_out(self, t: float) -> float:
-        t = max(0.0, min(1.0, t))
-        return t * t * (3 - 2 * t)
-
+    # 🔥 优化：渲染使用LUT + 批量更新
     def _hex_to_rgb(self, hx: str):
         hx = hx.lstrip('#')
         return (int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16))
@@ -926,30 +1332,33 @@ class DesktopLyrics:
         t = max(0.0, min(1.0, t))
         return self._rgb_to_hex(tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3)))
 
+    # 🔥 优化：更智能的动画检测
     def _any_char_animating(self, now):
-        if not self.karaoke_enabled:
+        """优化动画检测：提前退出"""
+        if not self.karaoke_enabled or not self._char_items or not self.current_lyric:
             return False
-        if not self._char_items or not self.current_lyric:
-            return False
+
         s = self.current_lyric
         start_t = self.current_line_start
         end_t = max(start_t + 0.01, self.next_line_start)
-        total = end_t - start_t
-        n = max(1, len(s))
-        char_delay = total / n
-        fade_t = min(KARAOKE_FADE_TIME, max(0.05, char_delay * 0.99))
-        idxs = {0, n - 1, n // 2, n // 4, (3 * n) // 4}
-        for i in idxs:
-            ch_start = start_t + i * char_delay
-            p = (now - ch_start) / fade_t
-            if 0.0 < p < 1.0:
-                return True
-        return False
+
+        # 如果整行已完成，直接返回
+        if now > end_t + KARAOKE_FADE_TIME:
+            return False
+
+        # 如果还未开始，直接返回
+        if now < start_t:
+            return False
+
+        # 在过渡区间内
+        return True
 
     def _frame_delay_ms(self, fps):
-        fps = max(1, int(round(fps)))
+        """更智能的FPS调度"""
+        fps = max(1, min(fps, 144))
         return int(1000 / fps)
 
+    # 🔥 优化：动画循环使用LUT
     def animation_tick(self):
         now = self._now_playback_time()
         self.update_lyrics_with_time(now)
@@ -962,16 +1371,27 @@ class DesktopLyrics:
             n = max(1, len(s))
             char_delay = total / n
             fade_t = min(KARAOKE_FADE_TIME, max(0.05, char_delay * 0.9))
-            base = LYRIC_FG
-            hl = KARAOKE_HL_COLOR
             do_shimmer = KARAOKE_SHIMMER > 0.0
+
+            # 🔥 批量收集更新操作
+            updates = []
             for i, mid in enumerate(self._char_items):
                 ch_start = start_t + i * char_delay
-                p = self._ease_in_out((now - ch_start) / fade_t)
-                color = self._lerp_color_hex(base, hl, p)
+                p = (now - ch_start) / fade_t
+                p = max(0.0, min(1.0, p))
+
+                # 🔥 使用LUT快速查找颜色
+                color = self._get_color_from_lut(p, self._color_lut)
+
                 if do_shimmer and p > 0.5:
                     shimmer = KARAOKE_SHIMMER * max(0.0, math.sin(now * 6.28 + i * 0.6))
-                    color = self._lerp_color_hex(color, "#FFFFFF", shimmer)
+                    shimmer_color = self._get_color_from_lut(shimmer, self._shimmer_lut)
+                    color = self._lerp_color_hex(color, shimmer_color, shimmer)
+
+                updates.append((mid, color))
+
+            # 🔥 一次性更新
+            for mid, color in updates:
                 self.lyric_canvas.itemconfig(mid, fill=color)
 
         dt = time.perf_counter() - self._last_sync_mono
@@ -979,19 +1399,41 @@ class DesktopLyrics:
             next_delay = self._frame_delay_ms(PAUSED_FPS)
         else:
             moving = self._any_char_animating(now)
-            next_delay = self._frame_delay_ms(MAX_FPS_MOVING if moving else IDLE_FPS)
+            # 🔥 渐进式FPS
+            if moving:
+                target_fps = MAX_FPS_MOVING
+            else:
+                target_fps = 30 if self.visualizer_enabled else IDLE_FPS
+            next_delay = self._frame_delay_ms(target_fps)
+
         self.root.after(next_delay, self.animation_tick)
 
-    # 队列/消息
+    # 🔥 优化：队列处理 - 批量+去重
     def safe_update(self, msg_type, data=None):
         self.message_queue.put((msg_type, data))
 
     def process_queue(self):
+        """批量处理队列消息"""
         processed = 0
-        max_processed = 10
+        max_processed = 20  # 增加批处理大小
+
+        # 收集同类型消息，仅处理最新的
+        pending_updates = {}
+
         try:
             while processed < max_processed and not self.message_queue.empty():
                 msg_type, data = self.message_queue.get_nowait()
+
+                # 时间同步消息：仅保留最新
+                if msg_type == "time":
+                    pending_updates["time"] = data
+                else:
+                    pending_updates[msg_type] = data
+
+                processed += 1
+
+            # 批量应用更新
+            for msg_type, data in pending_updates.items():
                 if msg_type == "status":
                     self.update_status(data)
                 elif msg_type == "song":
@@ -1022,7 +1464,9 @@ class DesktopLyrics:
                     self._outline_items = []
                     self._line_positions = []
                     self._line_width = 0
-                    self._need_layout = True
+                    self._layout_dirty = True
+                    self._items_dirty = True
+                    self._last_lyric_hash = None
                     self._draw_center_text("正在加载歌词...", LYRIC_FG)
                     self.translation_label.config(text="")
                 elif msg_type == "full_lyric":
@@ -1046,6 +1490,7 @@ class DesktopLyrics:
                     self._outline_items = []
                     self._line_positions = []
                     self._line_width = 0
+                    self._last_lyric_hash = None
 
                     self.translation_label.config(text="")
                     self.song_label.config(text="等待连接...", fg=SONG_FG)
@@ -1058,9 +1503,9 @@ class DesktopLyrics:
                     self.last_lyric_index = -1
                     self.last_translation_index = -1
                     self.has_lyrics = False
-                processed += 1
         except Exception as e:
             print(f"处理队列时出错: {e}")
+
         self.root.after(100, self.process_queue)
 
     def _update_full_lyrics(self, lyric, tlyric):
