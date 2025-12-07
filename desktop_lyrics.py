@@ -1,6 +1,8 @@
 import asyncio
 import websockets
 import tkinter as tk
+from tkinter import messagebox
+from tkinter import ttk  # 新增：引入ttk用于进度条
 import json
 import queue
 import threading
@@ -13,6 +15,15 @@ import math
 import ctypes
 import numpy as np
 from colorsys import hls_to_rgb
+import os
+import sys
+
+# ============ 新增：依赖库检查 ============
+try:
+    import requests
+except ImportError:
+    print("❌ 未找到 requests 库，更新功能将不可用。请运行: pip install requests")
+    requests = None
 
 # ============ 音频库导入和错误处理 ============
 AUDIO_AVAILABLE = False
@@ -78,6 +89,142 @@ TRANSPARENT_KEY = "#FF00FF"
 # 颜色LUT步进数
 COLOR_LUT_STEPS = 100
 SHIMMER_LUT_STEPS = 50
+
+# ============ 新增：更新管理模块（带进度条） ============
+CURRENT_VERSION = "v0.1.0"
+REPO_OWNER = "beststoryilove"
+REPO_NAME = "Harmonia-DesktopLyrics"
+UPDATE_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"
+
+class UpdateManager:
+    def __init__(self, root):
+        self.root = root
+        self.check_window = None
+
+    def start_check(self):
+        """启动更新检查"""
+        if requests is None:
+            return
+        
+        # 创建一个“正在检查”的弹窗
+        self.check_window = tk.Toplevel(self.root)
+        self.check_window.title("检查更新")
+        self.check_window.geometry("300x100")
+        self.center_window(self.check_window)
+        self.check_window.transient(self.root)
+        
+        tk.Label(self.check_window, text="正在检查更新中...", font=("Microsoft YaHei UI", 12)).pack(expand=True)
+        
+        threading.Thread(target=self._check_thread, daemon=True).start()
+
+    def _check_thread(self):
+        try:
+            response = requests.get(UPDATE_API_URL, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            latest_tag = data.get("tag_name", "") # e.g., updatav0.1.1
+            body = data.get("body", "暂无更新日志")
+            
+            version_part = latest_tag.replace("updata", "").strip()
+            
+            self.root.after(0, self.check_window.destroy)
+            
+            if version_part and version_part != CURRENT_VERSION:
+                self.root.after(0, lambda: self._show_update_dialog(latest_tag, version_part, body))
+            else:
+                self.root.after(0, self._show_no_update_dialog)
+                
+        except Exception as e:
+            print(f"检查更新失败: {e}")
+            self.root.after(0, self.check_window.destroy)
+
+    def _show_update_dialog(self, tag, version_part, body):
+        msg = f"有更新！是否更新？\n\n最新版本: {version_part}\n更新日志如下：\n{body}"
+        if messagebox.askyesno("发现新版本", msg, parent=self.root):
+            self._download_update(tag, version_part)
+
+    def _show_no_update_dialog(self):
+        msg = f"您正在使用最新版，欢迎使用Harmonia桌面歌词！\n当前版本为 {CURRENT_VERSION}"
+        messagebox.showinfo("检查完成", msg, parent=self.root)
+
+    def _download_update(self, tag, version_part):
+        filename = f"Harmonia-DesktopLyrics-{version_part}.exe"
+        url = f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/{tag}/{filename}"
+        save_path = os.path.join(os.path.expanduser("~"), "Downloads", filename)
+        
+        # === 创建带进度条的下载窗口 ===
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("正在下载更新")
+        progress_win.geometry("380x150")
+        self.center_window(progress_win)
+        progress_win.transient(self.root)
+        progress_win.grab_set() # 模态窗口，禁止操作主界面
+        # 禁止用户直接关闭下载窗口，防止后台线程报错
+        progress_win.protocol("WM_DELETE_WINDOW", lambda: None) 
+
+        tk.Label(progress_win, text=f"正在下载: {filename}", font=("Microsoft YaHei UI", 10)).pack(pady=(20, 10))
+        
+        # 进度条变量
+        progress_var = tk.DoubleVar()
+        pb = ttk.Progressbar(progress_win, variable=progress_var, maximum=100)
+        pb.pack(fill="x", padx=30, pady=5)
+        
+        # 百分比标签
+        percent_label = tk.Label(progress_win, text="0.0%", font=("Microsoft YaHei UI", 9), fg="#666666")
+        percent_label.pack(pady=5)
+
+        # 启动下载线程
+        threading.Thread(target=self._download_file_thread, 
+                         args=(url, save_path, progress_win, progress_var, percent_label), 
+                         daemon=True).start()
+
+    def _download_file_thread(self, url, save_path, window, progress_var, percent_label):
+        try:
+            # stream=True 允许分块读取
+            with requests.get(url, stream=True, timeout=15) as r:
+                r.raise_for_status()
+                # 获取文件总大小
+                total_length = r.headers.get('content-length')
+
+                with open(save_path, 'wb') as f:
+                    if total_length is None: 
+                        # 如果服务器没返回大小，就直接写
+                        f.write(r.content)
+                        self.root.after(0, lambda: self._update_progress_ui(progress_var, percent_label, 100))
+                    else:
+                        dl = 0
+                        total_length = int(total_length)
+                        # 按块读取 (8KB)
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                dl += len(chunk)
+                                f.write(chunk)
+                                # 计算进度
+                                percent = (dl / total_length) * 100
+                                self.root.after(0, lambda p=percent: self._update_progress_ui(progress_var, percent_label, p))
+            
+            # 下载完成，关闭窗口并提示
+            self.root.after(0, window.destroy)
+            self.root.after(0, lambda: messagebox.showinfo("下载完成", f"下载成功！\n\n文件已保存至：\n{save_path}", parent=self.root))
+            
+        except Exception as e:
+            # 出错处理
+            self.root.after(0, window.destroy)
+            self.root.after(0, lambda: messagebox.showerror("下载失败", f"下载出错: {e}", parent=self.root))
+
+    def _update_progress_ui(self, var, label, percent):
+        """主线程更新UI回调"""
+        var.set(percent)
+        label.config(text=f"{percent:.1f}%")
+
+    def center_window(self, win):
+        win.update_idletasks()
+        width = win.winfo_width()
+        height = win.winfo_height()
+        x = (win.winfo_screenwidth() // 2) - (width // 2)
+        y = (win.winfo_screenheight() // 2) - (height // 2)
+        win.geometry(f'+{x}+{y}')
 
 # ============ 新增：视觉特效类 ============
 class VisualEffects:
@@ -735,9 +882,9 @@ class VisualizerOverlay:
             _apply(self.canvas.winfo_id())
         except Exception:
             pass
-        self._apply_click_through_to_all_children()
+        self._apply_click_through_to_all_children(self.win.winfo_id())
 
-    def _apply_click_through_to_all_children(self):
+    def _apply_click_through_to_all_children(self, parent_hwnd):
         EnumChildWindows = ctypes.windll.user32.EnumChildWindows
         GetWindowLong = ctypes.windll.user32.GetWindowLongW
         SetWindowLong = ctypes.windll.user32.SetWindowLongW
@@ -763,7 +910,7 @@ class VisualizerOverlay:
             return True
 
         try:
-            EnumChildWindows(self.win.winfo_id(), _enum_proc, 0)
+            EnumChildWindows(parent_hwnd, _enum_proc, 0)
         except Exception:
             pass
 
@@ -820,7 +967,7 @@ class DesktopLyrics:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Harmonia桌面歌词")
+        self.root.title(f"Harmonia桌面歌词 - {CURRENT_VERSION}")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-transparentcolor", BG_COLOR)
@@ -895,6 +1042,13 @@ class DesktopLyrics:
                 print("律动条将不可用，但歌词功能正常")
                 self.visualizer = None
                 self.visualizer_enabled = False
+
+        # =========================================
+        # 集成更新检查
+        # =========================================
+        self.updater = UpdateManager(self.root)
+        # 延迟1秒启动检查，避免影响主界面启动
+        self.root.after(1000, self.updater.start_check)
 
     def _build_fonts(self):
         self.lyric_font = tkfont.Font(family=FONT_NAME, size=LYRIC_FONT_SIZE, weight="bold")
@@ -1608,4 +1762,3 @@ if __name__ == "__main__":
     server_thread.start()
     app.run()
     print("程序已退出")
-
