@@ -91,7 +91,7 @@ COLOR_LUT_STEPS = 100
 SHIMMER_LUT_STEPS = 50
 
 # ============ 新增：更新管理模块（带进度条） ============
-CURRENT_VERSION = "v0.1.0"
+CURRENT_VERSION = "v0.1.0"  # 【重要】发布新版前，必须修改此处的版本号！
 REPO_OWNER = "beststoryilove"
 REPO_NAME = "Harmonia-DesktopLyrics"
 UPDATE_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"
@@ -106,16 +106,27 @@ class UpdateManager:
         if requests is None:
             return
         
-        # 创建一个“正在检查”的弹窗
+        # 弹窗显示正在检查
         self.check_window = tk.Toplevel(self.root)
         self.check_window.title("检查更新")
         self.check_window.geometry("300x100")
         self.center_window(self.check_window)
         self.check_window.transient(self.root)
+        self.check_window.grab_set() # 模态
         
         tk.Label(self.check_window, text="正在检查更新中...", font=("Microsoft YaHei UI", 12)).pack(expand=True)
         
         threading.Thread(target=self._check_thread, daemon=True).start()
+
+    def _parse_version(self, v_str):
+        """将版本字符串解析为数字元组，例如 'v0.1.2' -> (0, 1, 2)"""
+        try:
+            # 移除常见前缀
+            clean_ver = v_str.lower().replace("updata", "").replace("v", "").strip()
+            # 分割并转为整数
+            return tuple(int(x) for x in clean_ver.split("."))
+        except Exception:
+            return (0, 0, 0)
 
     def _check_thread(self):
         try:
@@ -126,26 +137,39 @@ class UpdateManager:
             latest_tag = data.get("tag_name", "") # e.g., updatav0.1.1
             body = data.get("body", "暂无更新日志")
             
-            version_part = latest_tag.replace("updata", "").strip()
+            # 解析版本号
+            remote_ver_str = latest_tag.replace("updata", "").strip()
             
+            # === 关键修复：语义化版本比对 ===
+            local_ver = self._parse_version(CURRENT_VERSION)
+            remote_ver = self._parse_version(remote_ver_str)
+            
+            print(f"[Update] Local: {local_ver}, Remote: {remote_ver}") # 调试输出
+
+            # 关闭检查窗口
             self.root.after(0, self.check_window.destroy)
             
-            if version_part and version_part != CURRENT_VERSION:
-                self.root.after(0, lambda: self._show_update_dialog(latest_tag, version_part, body))
+            # 只有当 远程版本 > 当前版本 时才提示更新
+            if remote_ver > local_ver:
+                self.root.after(0, lambda: self._show_update_dialog(latest_tag, remote_ver_str, body))
             else:
-                self.root.after(0, self._show_no_update_dialog)
+                # 远程版本 <= 当前版本（包含相同或者是开发版更新的情况），视为无更新
+                self.root.after(0, lambda: self._show_no_update_dialog(remote_ver_str))
                 
         except Exception as e:
             print(f"检查更新失败: {e}")
             self.root.after(0, self.check_window.destroy)
+            # 网络错误可以选择静默失败，或者提示用户
+            # self.root.after(0, lambda: messagebox.showerror("检查失败", f"网络错误: {e}"))
 
     def _show_update_dialog(self, tag, version_part, body):
-        msg = f"有更新！是否更新？\n\n最新版本: {version_part}\n更新日志如下：\n{body}"
+        msg = f"发现新版本！\n\n当前版本: {CURRENT_VERSION}\n最新版本: {version_part}\n\n更新日志：\n{body}\n\n是否立即更新？"
         if messagebox.askyesno("发现新版本", msg, parent=self.root):
             self._download_update(tag, version_part)
 
-    def _show_no_update_dialog(self):
-        msg = f"您正在使用最新版，欢迎使用Harmonia桌面歌词！\n当前版本为 {CURRENT_VERSION}"
+    def _show_no_update_dialog(self, remote_version):
+        # 提示用户当前已是最新
+        msg = f"您正在使用最新版，欢迎使用Harmonia桌面歌词！\n\n当前版本: {CURRENT_VERSION}\n(远程版本: {remote_version})"
         messagebox.showinfo("检查完成", msg, parent=self.root)
 
     def _download_update(self, tag, version_part):
@@ -153,68 +177,56 @@ class UpdateManager:
         url = f"https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/download/{tag}/{filename}"
         save_path = os.path.join(os.path.expanduser("~"), "Downloads", filename)
         
-        # === 创建带进度条的下载窗口 ===
+        # === 进度条下载窗口 ===
         progress_win = tk.Toplevel(self.root)
         progress_win.title("正在下载更新")
-        progress_win.geometry("380x150")
+        progress_win.geometry("400x150")
         self.center_window(progress_win)
         progress_win.transient(self.root)
-        progress_win.grab_set() # 模态窗口，禁止操作主界面
-        # 禁止用户直接关闭下载窗口，防止后台线程报错
-        progress_win.protocol("WM_DELETE_WINDOW", lambda: None) 
+        progress_win.grab_set()
+        progress_win.protocol("WM_DELETE_WINDOW", lambda: None) # 禁止关闭
 
         tk.Label(progress_win, text=f"正在下载: {filename}", font=("Microsoft YaHei UI", 10)).pack(pady=(20, 10))
         
-        # 进度条变量
         progress_var = tk.DoubleVar()
         pb = ttk.Progressbar(progress_win, variable=progress_var, maximum=100)
         pb.pack(fill="x", padx=30, pady=5)
         
-        # 百分比标签
-        percent_label = tk.Label(progress_win, text="0.0%", font=("Microsoft YaHei UI", 9), fg="#666666")
+        percent_label = tk.Label(progress_win, text="准备开始...", font=("Microsoft YaHei UI", 9), fg="#666666")
         percent_label.pack(pady=5)
 
-        # 启动下载线程
         threading.Thread(target=self._download_file_thread, 
                          args=(url, save_path, progress_win, progress_var, percent_label), 
                          daemon=True).start()
 
     def _download_file_thread(self, url, save_path, window, progress_var, percent_label):
         try:
-            # stream=True 允许分块读取
-            with requests.get(url, stream=True, timeout=15) as r:
+            with requests.get(url, stream=True, timeout=30) as r:
                 r.raise_for_status()
-                # 获取文件总大小
                 total_length = r.headers.get('content-length')
 
                 with open(save_path, 'wb') as f:
                     if total_length is None: 
-                        # 如果服务器没返回大小，就直接写
                         f.write(r.content)
                         self.root.after(0, lambda: self._update_progress_ui(progress_var, percent_label, 100))
                     else:
                         dl = 0
                         total_length = int(total_length)
-                        # 按块读取 (8KB)
                         for chunk in r.iter_content(chunk_size=8192):
                             if chunk:
                                 dl += len(chunk)
                                 f.write(chunk)
-                                # 计算进度
                                 percent = (dl / total_length) * 100
                                 self.root.after(0, lambda p=percent: self._update_progress_ui(progress_var, percent_label, p))
             
-            # 下载完成，关闭窗口并提示
             self.root.after(0, window.destroy)
-            self.root.after(0, lambda: messagebox.showinfo("下载完成", f"下载成功！\n\n文件已保存至：\n{save_path}", parent=self.root))
+            self.root.after(0, lambda: messagebox.showinfo("下载完成", f"下载成功！\n请前往下载目录运行新版本：\n{save_path}", parent=self.root))
             
         except Exception as e:
-            # 出错处理
             self.root.after(0, window.destroy)
             self.root.after(0, lambda: messagebox.showerror("下载失败", f"下载出错: {e}", parent=self.root))
 
     def _update_progress_ui(self, var, label, percent):
-        """主线程更新UI回调"""
         var.set(percent)
         label.config(text=f"{percent:.1f}%")
 
