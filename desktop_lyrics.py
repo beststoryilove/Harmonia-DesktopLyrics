@@ -92,7 +92,7 @@ COLOR_LUT_STEPS = 100
 SHIMMER_LUT_STEPS = 50
 
 # ============ 更新管理模块（带进度条） ============
-CURRENT_VERSION = "v0.1.0"
+CURRENT_VERSION = "v0.1.1"
 REPO_OWNER = "beststoryilove"
 REPO_NAME = "Harmonia-DesktopLyrics"
 UPDATE_API_URL = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases/latest"
